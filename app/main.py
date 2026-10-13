@@ -29,6 +29,63 @@ def startup_event():
     db.attendance_logs.create_index([("emp_code", ASCENDING), ("date", ASCENDING)], unique=True)
     # Support fast list_attendance sorting
     db.attendance_logs.create_index([("date", DESCENDING), ("emp_code", ASCENDING)])
+    # Enforce unique shift_code
+    db.shifts.create_index("shift_code", unique=True)
+
+    # Seed default enterprise shifts if shifts collection is empty
+    if db.shifts.count_documents({}) == 0:
+        now_ts = now_truncated()
+        default_shifts = [
+            {
+                "shift_code": "GENERAL",
+                "name": "General Day Shift",
+                "start_time": "09:30",
+                "end_time": "18:30",
+                "grace_period_minutes": 10,
+                "half_day_threshold_hours": 4.5,
+                "overtime_threshold_minutes": 30,
+                "description": "Standard 9:30 AM to 6:30 PM corporate shift with 10-minute grace period.",
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            },
+            {
+                "shift_code": "MORNING",
+                "name": "Early Morning Shift",
+                "start_time": "06:00",
+                "end_time": "15:00",
+                "grace_period_minutes": 15,
+                "half_day_threshold_hours": 4.5,
+                "overtime_threshold_minutes": 30,
+                "description": "Early morning operational shift with 15-minute grace period.",
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            },
+            {
+                "shift_code": "EVENING",
+                "name": "Evening Shift",
+                "start_time": "14:00",
+                "end_time": "23:00",
+                "grace_period_minutes": 10,
+                "half_day_threshold_hours": 4.5,
+                "overtime_threshold_minutes": 30,
+                "description": "Mid-day to night shift with 10-minute grace period.",
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            },
+            {
+                "shift_code": "NIGHT",
+                "name": "Night Shift (Overnight)",
+                "start_time": "22:00",
+                "end_time": "06:00",
+                "grace_period_minutes": 15,
+                "half_day_threshold_hours": 4.5,
+                "overtime_threshold_minutes": 30,
+                "description": "Graveyard overnight shift spanning across midnight with 15-minute grace period.",
+                "created_at": now_ts,
+                "updated_at": now_ts,
+            },
+        ]
+        db.shifts.insert_many(default_shifts)
 
 # --------------------------------------------------------------------------- #
 # Helpers
@@ -42,6 +99,31 @@ def to_epoch_ms(dt: datetime) -> int:
 def now_truncated() -> datetime:
     n = datetime.now(timezone.utc)
     return n.replace(microsecond=0)
+
+def get_employee_shift_config(emp: dict) -> dict:
+    shift_code = emp.get("shift_code")
+    if shift_code:
+        shift_doc = db.shifts.find_one({"shift_code": shift_code.upper()})
+        if shift_doc:
+            return {
+                "shift_code": shift_doc["shift_code"],
+                "name": shift_doc.get("name", shift_code),
+                "shift_start": shift_doc.get("start_time", "09:30"),
+                "shift_end": shift_doc.get("end_time", "18:30"),
+                "grace_period_minutes": shift_doc.get("grace_period_minutes", 10),
+                "half_day_threshold_hours": shift_doc.get("half_day_threshold_hours", 4.5),
+                "overtime_threshold_minutes": shift_doc.get("overtime_threshold_minutes", 30),
+            }
+    # Graceful fallback to employee embedded timings & standard 10m grace period
+    return {
+        "shift_code": "GENERAL",
+        "name": "General Day Shift",
+        "shift_start": emp.get("shift_start", "09:30"),
+        "shift_end": emp.get("shift_end", "18:30"),
+        "grace_period_minutes": 10,
+        "half_day_threshold_hours": 4.5,
+        "overtime_threshold_minutes": 30,
+    }
 
 def get_attendance_date(punch_in_utc: datetime, shift_start: str, shift_end: str) -> str:
     punch_in_ist = punch_in_utc.astimezone(IST)
@@ -59,17 +141,19 @@ def get_shift_end_dt(attendance_date: str, shift_start: str, shift_end: str) -> 
         end_dt += timedelta(days=1)
     return end_dt
 
-def compute_late_minutes(punch_in_utc: datetime, attendance_date: str, shift_start: str) -> int:
+def compute_late_minutes(punch_in_utc: datetime, attendance_date: str, shift_start: str, grace_period_minutes: int = 10) -> int:
     start_dt = get_shift_start_dt(attendance_date, shift_start)
     diff_sec = (punch_in_utc - start_dt).total_seconds()
-    if diff_sec > 600:
+    grace_sec = grace_period_minutes * 60
+    if diff_sec > grace_sec:
         return int(diff_sec // 60)
     return 0
 
-def compute_overtime(punch_out_utc: datetime, attendance_date: str, shift_start: str, shift_end: str) -> int:
+def compute_overtime(punch_out_utc: datetime, attendance_date: str, shift_start: str, shift_end: str, overtime_threshold_minutes: int = 30) -> int:
     end_dt = get_shift_end_dt(attendance_date, shift_start, shift_end)
     diff_sec = (punch_out_utc - end_dt).total_seconds()
-    if diff_sec >= 1800:
+    threshold_sec = overtime_threshold_minutes * 60
+    if diff_sec >= threshold_sec:
         return int(diff_sec // 60)
     return 0
 
@@ -78,8 +162,8 @@ def compute_work_hours(punch_in_utc: datetime, punch_out_utc: datetime) -> float
     val = Decimal(diff_sec) / Decimal(3600)
     return float(val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP))
 
-def compute_half_day(work_hours: float) -> bool:
-    return work_hours < 4.50
+def compute_half_day(work_hours: float, threshold_hours: float = 4.50) -> bool:
+    return work_hours < threshold_hours
 
 def format_attendance(doc: dict) -> dict:
     if not doc: return doc
@@ -97,16 +181,49 @@ def format_attendance(doc: dict) -> dict:
                     if changes[k].get("to"): changes[k]["to"] = to_epoch_ms(changes[k]["to"])
     return d
 
+def format_shift(doc: dict) -> dict:
+    if not doc: return doc
+    d = dict(doc)
+    d.pop("_id", None)
+    if d.get("created_at") and isinstance(d["created_at"], datetime):
+        d["created_at"] = to_epoch_ms(d["created_at"])
+    if d.get("updated_at") and isinstance(d["updated_at"], datetime):
+        d["updated_at"] = to_epoch_ms(d["updated_at"])
+    return d
+
 # --------------------------------------------------------------------------- #
 # Models
 # --------------------------------------------------------------------------- #
+class ShiftIn(BaseModel):
+    shift_code: str = Field(..., pattern=r'^[A-Za-z0-9_-]{2,20}$')
+    name: str = Field(..., min_length=2, max_length=100)
+    start_time: str = Field(..., pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    end_time: str = Field(..., pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    grace_period_minutes: int = Field(10, ge=0, le=120)
+    half_day_threshold_hours: float = Field(4.5, ge=1.0, le=12.0)
+    overtime_threshold_minutes: int = Field(30, ge=0, le=180)
+    description: Optional[str] = Field(None, max_length=250)
+
+class ShiftUpdateIn(BaseModel):
+    name: Optional[str] = Field(None, min_length=2, max_length=100)
+    start_time: Optional[str] = Field(None, pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    end_time: Optional[str] = Field(None, pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    grace_period_minutes: Optional[int] = Field(None, ge=0, le=120)
+    half_day_threshold_hours: Optional[float] = Field(None, ge=1.0, le=12.0)
+    overtime_threshold_minutes: Optional[int] = Field(None, ge=0, le=180)
+    description: Optional[str] = Field(None, max_length=250)
+
+class AssignShiftIn(BaseModel):
+    shift_code: str = Field(..., pattern=r'^[A-Za-z0-9_-]{2,20}$')
+
 class EmployeeIn(BaseModel):
     emp_code: str = Field(..., pattern=r'^EMP\d{4,6}$')
     name: str = Field(..., min_length=1, max_length=100)
     email: str = Field(..., max_length=120, pattern=r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
     department: str = Field(..., min_length=1, max_length=50)
-    shift_start: str = Field("09:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
-    shift_end: str = Field("18:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    shift_code: Optional[str] = Field(None, pattern=r'^[A-Za-z0-9_-]{2,20}$')
+    shift_start: Optional[str] = Field(None, pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
+    shift_end: Optional[str] = Field(None, pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
     joined_on: str
 
 class PunchInIn(BaseModel):
@@ -126,6 +243,74 @@ class RegularizeRequest(BaseModel):
     punch_out: Optional[int] = None
 
 # --------------------------------------------------------------------------- #
+# Shift Management Endpoints
+# --------------------------------------------------------------------------- #
+@app.post("/shifts", status_code=201)
+def create_shift(body: ShiftIn):
+    shift_code = body.shift_code.upper()
+    doc = body.model_dump()
+    doc["shift_code"] = shift_code
+    now_ts = now_truncated()
+    doc["created_at"] = now_ts
+    doc["updated_at"] = now_ts
+    try:
+        db.shifts.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(409, f"Shift with code '{shift_code}' already exists")
+    return format_shift(doc)
+
+@app.get("/shifts")
+def list_shifts():
+    shifts = list(db.shifts.find({}, {"_id": 0}).sort("shift_code", ASCENDING))
+    return {"items": [format_shift(s) for s in shifts], "total": len(shifts)}
+
+@app.get("/shifts/{shift_code}")
+def get_shift(shift_code: str = Path(...)):
+    shift = db.shifts.find_one({"shift_code": shift_code.upper()})
+    if not shift:
+        raise HTTPException(404, f"Shift '{shift_code}' not found")
+    return format_shift(shift)
+
+@app.patch("/shifts/{shift_code}")
+def update_shift(shift_code: str = Path(...), body: ShiftUpdateIn = ...):
+    shift = db.shifts.find_one({"shift_code": shift_code.upper()})
+    if not shift:
+        raise HTTPException(404, f"Shift '{shift_code}' not found")
+    updates = {k: v for k, v in body.model_dump().items() if v is not None}
+    if not updates:
+        raise HTTPException(422, "No update fields provided")
+    updates["updated_at"] = now_truncated()
+    updated_shift = db.shifts.find_one_and_update(
+        {"shift_code": shift_code.upper()},
+        {"$set": updates},
+        return_document=True
+    )
+    return format_shift(updated_shift)
+
+@app.post("/employees/{emp_code}/shift")
+def assign_employee_shift(emp_code: str = Path(...), body: AssignShiftIn = ...):
+    emp = db.employees.find_one({"emp_code": emp_code})
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+    shift_code = body.shift_code.upper()
+    shift = db.shifts.find_one({"shift_code": shift_code})
+    if not shift:
+        raise HTTPException(404, f"Shift '{shift_code}' not found")
+    res = db.employees.find_one_and_update(
+        {"emp_code": emp_code},
+        {"$set": {
+            "shift_code": shift["shift_code"],
+            "shift_start": shift["start_time"],
+            "shift_end": shift["end_time"],
+        }},
+        return_document=True
+    )
+    res.pop("_id", None)
+    if res.get("created_at"):
+        res["created_at"] = to_epoch_ms(res["created_at"])
+    return res
+
+# --------------------------------------------------------------------------- #
 # Endpoints
 # --------------------------------------------------------------------------- #
 @app.get("/health")
@@ -139,6 +324,22 @@ def health():
 @app.post("/employees", status_code=201)
 def create_employee(body: EmployeeIn):
     doc = body.model_dump()
+    if doc.get("shift_code"):
+        shift = db.shifts.find_one({"shift_code": doc["shift_code"].upper()})
+        if not shift:
+            raise HTTPException(404, f"Shift '{doc['shift_code']}' not found")
+        doc["shift_code"] = shift["shift_code"]
+        if not doc.get("shift_start"):
+            doc["shift_start"] = shift["start_time"]
+        if not doc.get("shift_end"):
+            doc["shift_end"] = shift["end_time"]
+    else:
+        doc["shift_code"] = "GENERAL"
+        if not doc.get("shift_start"):
+            doc["shift_start"] = "09:30"
+        if not doc.get("shift_end"):
+            doc["shift_end"] = "18:30"
+
     doc["created_at"] = now_truncated()
     try:
         db.employees.insert_one(doc)
@@ -169,17 +370,20 @@ def punch_in(body: PunchInIn):
     if not emp:
         raise HTTPException(404, "Employee not found")
         
+    shift_cfg = get_employee_shift_config(emp)
     ts = parse_epoch_ms(body.punched_at) if body.punched_at else now_truncated()
-    d = get_attendance_date(ts, emp["shift_start"], emp["shift_end"])
+    d = get_attendance_date(ts, shift_cfg["shift_start"], shift_cfg["shift_end"])
+    late_minutes = compute_late_minutes(ts, d, shift_cfg["shift_start"], shift_cfg["grace_period_minutes"])
     
     doc = {
         "emp_code": body.emp_code,
         "date": d,
+        "shift_code": shift_cfg["shift_code"],
         "status": body.status,
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, d, emp["shift_start"]),
+        "late_minutes": late_minutes,
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
@@ -196,6 +400,7 @@ def punch_out(body: PunchOutIn):
     if not emp:
         raise HTTPException(404, "Employee not found")
         
+    shift_cfg = get_employee_shift_config(emp)
     ts = parse_epoch_ms(body.punched_at) if body.punched_at else now_truncated()
     
     record = db.attendance_logs.find_one(
@@ -212,8 +417,14 @@ def punch_out(body: PunchOutIn):
         raise HTTPException(422, "Invalid punch_out time")
         
     work_hours = compute_work_hours(record["punch_in"], ts)
-    overtime_minutes = compute_overtime(ts, record["date"], emp["shift_start"], emp["shift_end"])
-    half_day = compute_half_day(work_hours)
+    overtime_minutes = compute_overtime(
+        ts,
+        record["date"],
+        shift_cfg["shift_start"],
+        shift_cfg["shift_end"],
+        shift_cfg["overtime_threshold_minutes"]
+    )
+    half_day = compute_half_day(work_hours, shift_cfg["half_day_threshold_hours"])
     
     res = db.attendance_logs.find_one_and_update(
         {"_id": record["_id"], "punch_out": None},
@@ -262,6 +473,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
     if not record: raise HTTPException(404, "Record not found")
         
+    shift_cfg = get_employee_shift_config(emp)
     new_status = body.status if body.status is not None else record["status"]
     
     if body.punch_in is not None: new_punch_in = parse_epoch_ms(body.punch_in)
@@ -281,7 +493,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
     else:
         if new_punch_in is None:
             raise HTTPException(422, "Presence status requires punch_in")
-        computed_date = get_attendance_date(new_punch_in, emp["shift_start"], emp["shift_end"])
+        computed_date = get_attendance_date(new_punch_in, shift_cfg["shift_start"], shift_cfg["shift_end"])
         if computed_date != date:
             raise HTTPException(422, f"punch_in date {computed_date} does not match {date}")
         if new_punch_out:
@@ -294,11 +506,17 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         new_overtime_minutes = 0
         new_half_day = False
     else:
-        new_late_minutes = compute_late_minutes(new_punch_in, date, emp["shift_start"])
+        new_late_minutes = compute_late_minutes(new_punch_in, date, shift_cfg["shift_start"], shift_cfg["grace_period_minutes"])
         if new_punch_out:
             new_work_hours = compute_work_hours(new_punch_in, new_punch_out)
-            new_overtime_minutes = compute_overtime(new_punch_out, date, emp["shift_start"], emp["shift_end"])
-            new_half_day = compute_half_day(new_work_hours)
+            new_overtime_minutes = compute_overtime(
+                new_punch_out,
+                date,
+                shift_cfg["shift_start"],
+                shift_cfg["shift_end"],
+                shift_cfg["overtime_threshold_minutes"]
+            )
+            new_half_day = compute_half_day(new_work_hours, shift_cfg["half_day_threshold_hours"])
         else:
             new_work_hours = None
             new_overtime_minutes = 0
