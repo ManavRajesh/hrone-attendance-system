@@ -1,19 +1,24 @@
 import os
 import calendar
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, List, Literal
 from decimal import Decimal, ROUND_HALF_UP
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Path, Query, Request
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from pymongo import MongoClient, ASCENDING, DESCENDING
 from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
-client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"))
+client = MongoClient(os.getenv("MONGO_URI", "mongodb://localhost:27017"), tz_aware=True)
 db = client[os.getenv("MONGO_DB", "attendance_db")]
+
+PRESENT_STATUSES = {"PRESENT", "WFH", "ON_DUTY"}
+VALID_STATUSES = PRESENT_STATUSES | {"ABSENT", "LEAVE"}
+EPOCH_MS_MIN = 100000000000
+EPOCH_MS_MAX = 4102444800000
 
 IST = timezone(timedelta(hours=5, minutes=30), "IST")
 
@@ -33,11 +38,42 @@ def startup_event():
 # --------------------------------------------------------------------------- #
 # Helpers
 # --------------------------------------------------------------------------- #
+def parse_date(value: str) -> datetime.date:
+    if not isinstance(value, str):
+        raise ValueError("date must be YYYY-MM-DD")
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError("date must be YYYY-MM-DD") from exc
+
+
+def parse_month(value: str) -> str:
+    if not isinstance(value, str):
+        raise ValueError("month must be YYYY-MM")
+    try:
+        year, month = value.split("-")
+        y = int(year)
+        m = int(month)
+        if len(year) != 4 or m < 1 or m > 12:
+            raise ValueError
+        calendar.monthrange(y, m)
+        return f"{y:04d}-{m:02d}"
+    except Exception as exc:
+        raise ValueError("month must be YYYY-MM") from exc
+
+
 def parse_epoch_ms(epoch_ms: int) -> datetime:
-    return datetime.fromtimestamp(epoch_ms // 1000, tz=timezone.utc)
+    if isinstance(epoch_ms, bool) or not isinstance(epoch_ms, int):
+        raise ValueError("timestamp must be an integer epoch millisecond value")
+    if not (EPOCH_MS_MIN <= epoch_ms <= EPOCH_MS_MAX):
+        raise ValueError("timestamp out of range")
+    return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc)
+
 
 def to_epoch_ms(dt: datetime) -> int:
-    return int(dt.timestamp() * 1000)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.astimezone(timezone.utc).timestamp() * 1000)
 
 def now_truncated() -> datetime:
     n = datetime.now(timezone.utc)
@@ -109,21 +145,84 @@ class EmployeeIn(BaseModel):
     shift_end: str = Field("18:30", pattern=r'^([01]\d|2[0-3]):[0-5]\d$')
     joined_on: str
 
+    @field_validator("joined_on")
+    @classmethod
+    def validate_joined_on(cls, value: str) -> str:
+        parse_date(value)
+        return value
+
+    @model_validator(mode="after")
+    def validate_shift_times(self):
+        if self.shift_start == self.shift_end:
+            raise ValueError("shift_start and shift_end must differ")
+        return self
+
+
 class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
-    status: str = "PRESENT"
+    status: Literal["PRESENT", "WFH", "ON_DUTY"] = "PRESENT"
+
+    @field_validator("punched_at")
+    @classmethod
+    def validate_punched_at(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            raise ValueError("punched_at must be a valid epoch millisecond integer")
+        if not isinstance(value, int):
+            raise ValueError("punched_at must be a valid epoch millisecond integer")
+        parse_epoch_ms(value)
+        return value
+
 
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
 
+    @field_validator("punched_at")
+    @classmethod
+    def validate_punched_at(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            raise ValueError("punched_at must be a valid epoch millisecond integer")
+        if not isinstance(value, int):
+            raise ValueError("punched_at must be a valid epoch millisecond integer")
+        parse_epoch_ms(value)
+        return value
+
+
 class RegularizeRequest(BaseModel):
     reason: str = Field(..., min_length=5, max_length=200)
     regularized_by: str = Field(..., min_length=1, max_length=50)
-    status: Optional[str] = None
+    status: Optional[Literal["PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"]] = None
     punch_in: Optional[int] = None
     punch_out: Optional[int] = None
+
+    @field_validator("punch_in")
+    @classmethod
+    def validate_punch_in(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            raise ValueError("punch_in must be a valid epoch millisecond integer")
+        if not isinstance(value, int):
+            raise ValueError("punch_in must be a valid epoch millisecond integer")
+        parse_epoch_ms(value)
+        return value
+
+    @field_validator("punch_out")
+    @classmethod
+    def validate_punch_out(cls, value: Optional[int]) -> Optional[int]:
+        if value is None:
+            return value
+        if isinstance(value, bool):
+            raise ValueError("punch_out must be a valid epoch millisecond integer")
+        if not isinstance(value, int):
+            raise ValueError("punch_out must be a valid epoch millisecond integer")
+        parse_epoch_ms(value)
+        return value
 
 # --------------------------------------------------------------------------- #
 # Endpoints
@@ -150,6 +249,8 @@ def create_employee(body: EmployeeIn):
 
 @app.get("/employees")
 def list_employees(department: Optional[str] = None, page: int = 1, page_size: int = 20):
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(422, "Invalid pagination parameters")
     q = {}
     if department:
         q["department"] = department
@@ -162,16 +263,13 @@ def list_employees(department: Optional[str] = None, page: int = 1, page_size: i
 
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
-    if body.status not in ["PRESENT", "WFH", "ON_DUTY"]:
-        raise HTTPException(422, "Invalid status for punch-in")
-        
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if not emp:
         raise HTTPException(404, "Employee not found")
-        
-    ts = parse_epoch_ms(body.punched_at) if body.punched_at else now_truncated()
+
+    ts = parse_epoch_ms(body.punched_at) if body.punched_at is not None else now_truncated()
     d = get_attendance_date(ts, emp["shift_start"], emp["shift_end"])
-    
+
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -195,26 +293,26 @@ def punch_out(body: PunchOutIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if not emp:
         raise HTTPException(404, "Employee not found")
-        
-    ts = parse_epoch_ms(body.punched_at) if body.punched_at else now_truncated()
-    
+
+    ts = parse_epoch_ms(body.punched_at) if body.punched_at is not None else now_truncated()
+
     record = db.attendance_logs.find_one(
         {"emp_code": body.emp_code, "punch_in": {"$lte": ts}},
         sort=[("punch_in", DESCENDING)]
     )
     if not record:
         raise HTTPException(404, "No punch-in found")
-        
+
     if record.get("punch_out"):
         raise HTTPException(409, "Already punched out")
-        
+
     if ts <= record["punch_in"] or (ts - record["punch_in"]).total_seconds() > 24 * 3600:
         raise HTTPException(422, "Invalid punch_out time")
-        
+
     work_hours = compute_work_hours(record["punch_in"], ts)
     overtime_minutes = compute_overtime(ts, record["date"], emp["shift_start"], emp["shift_end"])
     half_day = compute_half_day(work_hours)
-    
+
     res = db.attendance_logs.find_one_and_update(
         {"_id": record["_id"], "punch_out": None},
         {"$set": {
@@ -238,9 +336,17 @@ def list_attendance(
     page: int = 1,
     page_size: int = 20,
 ):
+    if page < 1 or page_size < 1 or page_size > 100:
+        raise HTTPException(422, "Invalid pagination parameters")
+    if date_from is not None:
+        parse_date(date_from)
+    if date_to is not None:
+        parse_date(date_to)
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, "date_from > date_to")
-        
+    if status is not None and status not in VALID_STATUSES:
+        raise HTTPException(422, "Invalid status")
+
     q = {}
     if emp_code: q["emp_code"] = emp_code
     if date_from or date_to:
@@ -248,7 +354,7 @@ def list_attendance(
         if date_from: q["date"]["$gte"] = date_from
         if date_to: q["date"]["$lte"] = date_to
     if status: q["status"] = status
-    
+
     skip = (page - 1) * page_size
     total = db.attendance_logs.count_documents(q)
     docs = list(db.attendance_logs.find(q).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip(skip).limit(page_size))
@@ -256,25 +362,32 @@ def list_attendance(
 
 @app.patch("/attendance/{emp_code}/{date}")
 def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
+    parse_date(date)
     emp = db.employees.find_one({"emp_code": emp_code})
-    if not emp: raise HTTPException(404, "Employee not found")
-        
+    if not emp:
+        raise HTTPException(404, "Employee not found")
+
     record = db.attendance_logs.find_one({"emp_code": emp_code, "date": date})
-    if not record: raise HTTPException(404, "Record not found")
-        
-    new_status = body.status if body.status is not None else record["status"]
-    
-    if body.punch_in is not None: new_punch_in = parse_epoch_ms(body.punch_in)
-    elif "punch_in" in body.model_fields_set: new_punch_in = None
-    else: new_punch_in = record["punch_in"]
-        
-    if body.punch_out is not None: new_punch_out = parse_epoch_ms(body.punch_out)
-    elif "punch_out" in body.model_fields_set: new_punch_out = None
-    else: new_punch_out = record["punch_out"]
-        
+    if not record:
+        raise HTTPException(404, "Record not found")
+
+    new_status = body.status if body.status is not None else record.get("status")
+    if body.punch_in is not None:
+        new_punch_in = parse_epoch_ms(body.punch_in)
+    elif "punch_in" in body.model_fields_set:
+        new_punch_in = None
+    else:
+        new_punch_in = record.get("punch_in")
+
+    if body.punch_out is not None:
+        new_punch_out = parse_epoch_ms(body.punch_out)
+    elif "punch_out" in body.model_fields_set:
+        new_punch_out = None
+    else:
+        new_punch_out = record.get("punch_out")
+
     if new_status in ["ABSENT", "LEAVE"]:
-        if ("punch_in" in body.model_fields_set and body.punch_in is not None) or \
-           ("punch_out" in body.model_fields_set and body.punch_out is not None):
+        if body.punch_in is not None or body.punch_out is not None:
             raise HTTPException(422, "Cannot supply punch times for ABSENT/LEAVE")
         new_punch_in = None
         new_punch_out = None
@@ -284,10 +397,10 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         computed_date = get_attendance_date(new_punch_in, emp["shift_start"], emp["shift_end"])
         if computed_date != date:
             raise HTTPException(422, f"punch_in date {computed_date} does not match {date}")
-        if new_punch_out:
+        if new_punch_out is not None:
             if new_punch_out <= new_punch_in or (new_punch_out - new_punch_in).total_seconds() > 24 * 3600:
                 raise HTTPException(422, "Invalid punch_out time")
-                
+
     if new_status in ["ABSENT", "LEAVE"]:
         new_work_hours = None
         new_late_minutes = 0
@@ -295,7 +408,7 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         new_half_day = False
     else:
         new_late_minutes = compute_late_minutes(new_punch_in, date, emp["shift_start"])
-        if new_punch_out:
+        if new_punch_out is not None:
             new_work_hours = compute_work_hours(new_punch_in, new_punch_out)
             new_overtime_minutes = compute_overtime(new_punch_out, date, emp["shift_start"], emp["shift_end"])
             new_half_day = compute_half_day(new_work_hours)
@@ -303,32 +416,40 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
             new_work_hours = None
             new_overtime_minutes = 0
             new_half_day = False
-            
+
     changes = {}
+
     def check_change(field, old_val, new_val):
         if old_val != new_val:
             changes[field] = {"from": old_val, "to": new_val}
-            
-    check_change("status", record["status"], new_status)
-    check_change("punch_in", record["punch_in"], new_punch_in)
-    check_change("punch_out", record["punch_out"], new_punch_out)
-    check_change("work_hours", record["work_hours"], new_work_hours)
+
+    check_change("status", record.get("status"), new_status)
+    check_change("punch_in", record.get("punch_in"), new_punch_in)
+    check_change("punch_out", record.get("punch_out"), new_punch_out)
+    check_change("work_hours", record.get("work_hours"), new_work_hours)
     check_change("late_minutes", record.get("late_minutes", 0), new_late_minutes)
     check_change("overtime_minutes", record.get("overtime_minutes", 0), new_overtime_minutes)
     check_change("half_day", record.get("half_day", False), new_half_day)
-    
+
     if not changes:
         raise HTTPException(422, "Request changes nothing")
-        
+
     history_entry = {
         "at": now_truncated(),
         "by": body.regularized_by,
         "reason": body.reason,
-        "changes": changes
+        "changes": changes,
     }
-    
+
+    filter_doc = {
+        "_id": record["_id"],
+        "status": record.get("status"),
+        "punch_in": record.get("punch_in"),
+        "punch_out": record.get("punch_out"),
+        "$or": [{"history": {"$exists": False}}, {"history": {"$size": len(record.get("history", []))}}],
+    }
     res = db.attendance_logs.find_one_and_update(
-        {"_id": record["_id"], "history": {"$size": len(record.get("history", []))}},
+        filter_doc,
         {"$set": {
             "status": new_status, "punch_in": new_punch_in, "punch_out": new_punch_out,
             "work_hours": new_work_hours, "late_minutes": new_late_minutes,
@@ -336,7 +457,8 @@ def regularize_attendance(emp_code: str, date: str, body: RegularizeRequest):
         }, "$push": {"history": history_entry}},
         return_document=True
     )
-    if not res: raise HTTPException(409, "Concurrent modification")
+    if not res:
+        raise HTTPException(409, "Concurrent modification")
     return format_attendance(res)
 
 # --------------------------------------------------------------------------- #
@@ -485,25 +607,28 @@ def get_late_leaderboard_pipeline(month: str, limit: int, department: Optional[s
     return p
 
 def get_department_trend_pipeline(department: str, from_: str, to: str):
-    d_from = datetime.fromisoformat(from_)
-    d_to = datetime.fromisoformat(to)
+    from_date = parse_date(from_)
+    to_date = parse_date(to)
+    start_dt = datetime.combine(from_date, datetime.min.time(), tzinfo=timezone.utc)
+    end_dt = datetime.combine(to_date + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc)
+
     return [
         {"$match": {"department": department}},
         {"$limit": 1},
-        {"$project": {"_id": 0, "dummy": 1}},
+        {"$project": {"_id": 0, "date": {"$dateFromString": {"dateString": from_}}}},
         {"$densify": {
             "field": "date",
-            "range": {"step": 1, "unit": "day", "bounds": [d_from, d_to + timedelta(days=1)]}
+            "range": {"step": 1, "unit": "day", "bounds": [start_dt, end_dt]}
         }},
-        {"$project": {
+        {"$addFields": {
             "date": {"$dateToString": {"format": "%Y-%m-%d", "date": "$date"}},
-            "is_working_day": {"$in": [{"$isoDayOfWeek": "$date"}, [1, 2, 3, 4, 5]]}
+            "is_working_day": {"$in": [{"$isoDayOfWeek": {"$dateFromString": {"dateString": {"$toString": "$date"}}}}, [1, 2, 3, 4, 5]]}
         }},
         {"$lookup": {
             "from": "employees",
             "let": {"current_date": "$date"},
             "pipeline": [
-                {"$match": {"department": department, "$expr": {"$lte": ["$joined_on", "$$current_date"]}}},
+                {"$match": {"department": department, "$expr": {"$lte": [{"$dateFromString": {"dateString": "$joined_on"}}, {"$dateFromString": {"dateString": "$$current_date"}}]}}},
                 {"$count": "headcount"}
             ],
             "as": "emp_data"
@@ -515,7 +640,8 @@ def get_department_trend_pipeline(department: str, from_: str, to: str):
             "pipeline": [
                 {"$match": {"$expr": {"$eq": ["$date", "$$current_date"]}}},
                 {"$lookup": {"from": "employees", "localField": "emp_code", "foreignField": "emp_code", "as": "emp"}},
-                {"$match": {"emp.department": department}}
+                {"$unwind": "$emp"},
+                {"$match": {"$expr": {"$eq": ["$emp.department", department]}}}
             ],
             "as": "logs"
         }},
@@ -541,10 +667,8 @@ def get_department_trend_pipeline(department: str, from_: str, to: str):
             "attendance_rate": {
                 "$cond": [
                     {"$and": [{"$eq": ["$is_working_day", True]}, {"$gt": ["$headcount", 0]}]},
-                    {"$divide": [
-                        {"$trunc": {"$add": [{"$multiply": [{"$divide": ["$present_count", "$headcount"]}, 10000]}, 0.5]}},
-                        10000
-                    ]}, None
+                    {"$divide": ["$present_count", "$headcount"]},
+                    None
                 ]
             }
         }},
@@ -553,15 +677,8 @@ def get_department_trend_pipeline(department: str, from_: str, to: str):
             "output": {"moving_avg_7d_raw": {"$avg": "$attendance_rate", "window": {"documents": [-6, 0]}}}
         }},
         {"$addFields": {
-            "moving_avg_7d": {
-                "$cond": [
-                    {"$ne": ["$moving_avg_7d_raw", None]},
-                    {"$divide": [
-                        {"$trunc": {"$add": [{"$multiply": ["$moving_avg_7d_raw", 10000]}, 0.5]}},
-                        10000
-                    ]}, None
-                ]
-            }
+            "moving_avg_7d": {"$ifNull": ["$moving_avg_7d_raw", None]},
+            "attendance_rate": {"$ifNull": ["$attendance_rate", None]}
         }},
         {"$project": {
             "_id": 0, "date": 1, "is_working_day": 1, "headcount": 1,
@@ -642,6 +759,8 @@ def explain_endpoint(
     page_size: int = 20
 ):
     if endpoint == "attendance_list":
+        if page < 1 or page_size < 1 or page_size > 100:
+            raise HTTPException(422, "Invalid pagination parameters")
         q = {}
         if emp_code: q["emp_code"] = emp_code
         if date_from or date_to:
@@ -649,7 +768,7 @@ def explain_endpoint(
             if date_from: q["date"]["$gte"] = date_from
             if date_to: q["date"]["$lte"] = date_to
         if status: q["status"] = status
-        explain_plan = db.attendance_logs.find(q).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip((page - 1) * page_size).limit(page_size).explain()
+        explain_plan = db.attendance_logs.find(q).sort([("date", DESCENDING), ("emp_code", ASCENDING)]).skip((page - 1) * page_size).limit(page_size).explain({"verbosity": "executionStats"})
         return {"endpoint": endpoint, "collection": "attendance_logs", "explain": explain_plan}
         
     if endpoint == "employee_monthly":

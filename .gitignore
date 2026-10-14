@@ -34,6 +34,15 @@ env/
 *.swp
 *.swo
 
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+
+# Container build files are intentionally excluded from this repository
+Dockerfile
+**/Dockerfile
+
 # Testing & Coverage
 .pytest_cache/
 .coverage
